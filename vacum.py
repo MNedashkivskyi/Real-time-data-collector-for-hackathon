@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import requests
 from dotenv import load_dotenv
@@ -24,12 +25,22 @@ API_TOKEN = (os.getenv("WARSAW_API_TOKEN") or os.getenv("WARSAW_API_KEY") or os.
 
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "init.sql")
 
-def to_int(value):
-    """Convert a spot count to int, treating missing or malformed values as zero."""
+def to_int(value, default=0):
+    """Convert a spot count to int, falling back to a default for missing or malformed values."""
     try:
         return int(value)
     except (TypeError, ValueError):
-        return 0
+        return default
+
+def to_text(value):
+    """Store a descriptive field as text, serializing it if the API sends a list or object instead."""
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+def to_json(value):
+    """Wrap a structured field for a JSONB column, keeping missing values as NULL."""
+    return Json(value) if value is not None else None
 
 def to_float(value):
     """Convert a coordinate to float, treating missing or malformed values as NULL."""
@@ -134,13 +145,47 @@ def save_data(data):
 
                 # Insert or update static parking facility record
                 cur.execute("""
-                    INSERT INTO parkings (name, latitude, longitude, address, manager, category, total_spots)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO parkings (
+                        name, latitude, longitude, address, manager, category, total_spots,
+                        start_date, opening_hours, tariffs, levels, total_places, dimensions,
+                        accepted_payment_method, allowed_vehicle_type, additional_security,
+                        manager_email, manager_telephone, operator_telephone
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (name) DO UPDATE 
-                    SET total_spots = EXCLUDED.total_spots,
-                        latitude = EXCLUDED.latitude,
-                        longitude = EXCLUDED.longitude;
-                """, (name, lat, lon, address, manager, category, total_spots))
+                    SET latitude = EXCLUDED.latitude,
+                        longitude = EXCLUDED.longitude,
+                        address = EXCLUDED.address,
+                        manager = EXCLUDED.manager,
+                        category = EXCLUDED.category,
+                        total_spots = EXCLUDED.total_spots,
+                        start_date = EXCLUDED.start_date,
+                        opening_hours = EXCLUDED.opening_hours,
+                        tariffs = EXCLUDED.tariffs,
+                        levels = EXCLUDED.levels,
+                        total_places = EXCLUDED.total_places,
+                        dimensions = EXCLUDED.dimensions,
+                        accepted_payment_method = EXCLUDED.accepted_payment_method,
+                        allowed_vehicle_type = EXCLUDED.allowed_vehicle_type,
+                        additional_security = EXCLUDED.additional_security,
+                        manager_email = EXCLUDED.manager_email,
+                        manager_telephone = EXCLUDED.manager_telephone,
+                        operator_telephone = EXCLUDED.operator_telephone;
+                """, (
+                    name, lat, lon, address, manager, category, total_spots,
+                    to_text(item.get("start_date")),
+                    to_json(item.get("opening_hours")),
+                    to_json(item.get("tariffs")),
+                    to_int(item.get("levels"), None),
+                    to_json(item.get("total_places")),
+                    to_json(item.get("dimensions")),
+                    to_text(item.get("acceptedPaymentMethod")),
+                    to_text(item.get("allowedVehicleType")),
+                    to_text(item.get("additionalSecurity")),
+                    to_text(item.get("managerEmail")),
+                    to_text(item.get("managerTelephone")),
+                    to_text(item.get("operatorTelephone")),
+                ))
 
                 # Parse available spot metrics with safe fallback to zero
                 free_info = item.get("free_places_total") or {}

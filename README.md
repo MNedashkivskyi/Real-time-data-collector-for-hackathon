@@ -114,8 +114,10 @@ The collector applies `init.sql` on startup (and Docker Compose also runs it whe
 ### `parkings` (Dimension Table)
 
 - Tracks unique parking assets (`name` as primary key).
-- Stores capacity, geographical coordinates (`latitude`, `longitude`), operator metadata, and address.
-- Refreshes capacity and coordinates on incoming payloads via `ON CONFLICT (name) DO UPDATE`.
+- Stores every descriptive field the API returns: coordinates, address, capacity (`total_spots`, `levels`, per-level `total_places`), `start_date`, `opening_hours`, `tariffs`, `dimensions`, payment methods, allowed vehicle types, security, and manager/operator contact details.
+- Structured fields (`opening_hours`, `tariffs`, `total_places`, `dimensions`) are kept as `jsonb`.
+- Refreshes all fields on incoming payloads via `ON CONFLICT (name) DO UPDATE`.
+- New columns are added to existing databases automatically on startup (`ADD COLUMN IF NOT EXISTS`).
 
 ### `parking_occupancy_logs` (Time-Series Fact Table)
 
