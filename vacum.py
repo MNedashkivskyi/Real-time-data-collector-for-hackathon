@@ -22,6 +22,22 @@ API_URL = os.getenv(
 )
 API_TOKEN = (os.getenv("WARSAW_API_TOKEN") or os.getenv("WARSAW_API_KEY") or os.getenv("API_TOKEN") or "").strip(' "\'')
 
+SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "init.sql")
+
+def to_int(value):
+    """Convert a spot count to int, treating missing or malformed values as zero."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+def to_float(value):
+    """Convert a coordinate to float, treating missing or malformed values as NULL."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 def get_db_connection():
     """Establish and maintain a resilient database connection with auto-retry."""
     while True:
@@ -36,6 +52,20 @@ def get_db_connection():
         except psycopg2.OperationalError as e:
             print(f"[{datetime.now()}] Database connection error, retrying in 3 seconds: {e}")
             time.sleep(3)
+
+def ensure_schema():
+    """Create tables and indexes if they do not exist yet (init.sql is idempotent)."""
+    with open(SCHEMA_PATH, encoding="utf-8") as f:
+        schema_sql = f.read()
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(schema_sql)
+        conn.commit()
+        print(f"[{datetime.now()}] Database schema is ready.")
+    finally:
+        conn.close()
 
 def fetch_parking_data():
     """Fetch live parking occupancy data from the Warsaw Open Data API."""
@@ -56,68 +86,85 @@ def save_data(data):
         print(f"[{datetime.now()}] No data to save.")
         return
 
-    # 1. Check known primary keys
-    parkings_list = data.get("Parkings") or data.get("carParks")
+    # 1. Check known primary keys (or accept a bare top-level list)
+    parkings_list = None
+    if isinstance(data, list):
+        parkings_list = data
+    elif isinstance(data, dict):
+        parkings_list = data.get("Parkings") or data.get("carParks")
 
-    # 2. Dynamic fallback: extract the first non-empty list found in the payload
-    if not parkings_list and isinstance(data, dict):
-        for val in data.values():
-            if isinstance(val, list) and len(val) > 0:
-                parkings_list = val
-                break
+        # 2. Dynamic fallback: extract the first non-empty list found in the payload
+        if not parkings_list:
+            for val in data.values():
+                if isinstance(val, list) and len(val) > 0:
+                    parkings_list = val
+                    break
 
-    # 3. Abort gracefully if no list structure matches
+    # 3. Abort gracefully if no list structure matches, showing what the API actually returned
     if not parkings_list:
-        print(f"[{datetime.now()}] No parking list found in response.")
+        print(f"[{datetime.now()}] No parking list found in response: {str(data)[:500]}")
         return
 
     conn = get_db_connection()
     cur = conn.cursor()
 
     try:
+        saved = 0
+        skipped = 0
         for item in parkings_list:
-            name = item.get("name")
+            name = item.get("name") if isinstance(item, dict) else None
             if not name:
+                skipped += 1
                 continue
 
-            # Parse coordinates and descriptive metadata
-            lat = float(item.get("latitude")) if item.get("latitude") else None
-            lon = float(item.get("longitude")) if item.get("longitude") else None
-            address = item.get("adress", "")
-            manager = item.get("manager", "")
-            category = item.get("parkingCategory", "")
+            # Isolate each record so one malformed entry does not discard the whole batch
+            cur.execute("SAVEPOINT parking_item")
+            try:
+                # Parse coordinates and descriptive metadata
+                lat = to_float(item.get("latitude"))
+                lon = to_float(item.get("longitude"))
+                address = item.get("adress") or ""
+                manager = item.get("manager") or ""
+                category = item.get("parkingCategory") or ""
 
-            # Calculate total parking capacity across all levels
-            total_spots = 0
-            for lvl in item.get("total_places", []):
-                total_spots += lvl.get("standard", 0) + lvl.get("disabled", 0) + lvl.get("electric", 0)
+                # Calculate total parking capacity across all levels
+                total_spots = 0
+                for lvl in item.get("total_places") or []:
+                    total_spots += to_int(lvl.get("standard")) + to_int(lvl.get("disabled")) + to_int(lvl.get("electric"))
 
-            # Insert or update static parking facility record
-            cur.execute("""
-                INSERT INTO parkings (name, latitude, longitude, address, manager, category, total_spots)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (name) DO UPDATE 
-                SET total_spots = EXCLUDED.total_spots,
-                    latitude = EXCLUDED.latitude,
-                    longitude = EXCLUDED.longitude;
-            """, (name, lat, lon, address, manager, category, total_spots))
+                # Insert or update static parking facility record
+                cur.execute("""
+                    INSERT INTO parkings (name, latitude, longitude, address, manager, category, total_spots)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (name) DO UPDATE 
+                    SET total_spots = EXCLUDED.total_spots,
+                        latitude = EXCLUDED.latitude,
+                        longitude = EXCLUDED.longitude;
+                """, (name, lat, lon, address, manager, category, total_spots))
 
-            # Parse available spot metrics with safe fallback to zero
-            free_info = item.get("free_places_total", {})
-            free_public = free_info.get("public", 0) or 0
-            free_disabled = free_info.get("disabled", 0) or 0
-            free_electric = free_info.get("electric", 0) or 0
-            total_free = free_public + free_disabled + free_electric
+                # Parse available spot metrics with safe fallback to zero
+                free_info = item.get("free_places_total") or {}
+                free_public = to_int(free_info.get("public"))
+                free_disabled = to_int(free_info.get("disabled"))
+                free_electric = to_int(free_info.get("electric"))
+                total_free = free_public + free_disabled + free_electric
 
-            # Append time-series occupancy measurement
-            cur.execute("""
-                INSERT INTO parking_occupancy_logs 
-                (parking_name, free_public, free_disabled, free_electric, total_free, raw_payload)
-                VALUES (%s, %s, %s, %s, %s, %s);
-            """, (name, free_public, free_disabled, free_electric, total_free, Json(item)))
+                # Append time-series occupancy measurement
+                cur.execute("""
+                    INSERT INTO parking_occupancy_logs 
+                    (parking_name, free_public, free_disabled, free_electric, total_free, raw_payload)
+                    VALUES (%s, %s, %s, %s, %s, %s);
+                """, (name, free_public, free_disabled, free_electric, total_free, Json(item)))
+
+                cur.execute("RELEASE SAVEPOINT parking_item")
+                saved += 1
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT parking_item")
+                skipped += 1
+                print(f"[{datetime.now()}] Skipping parking '{name}': {e}")
 
         conn.commit()
-        print(f"[{datetime.now()}] Saved {len(parkings_list)} parking entries to the database.")
+        print(f"[{datetime.now()}] Saved {saved} parking entries to the database ({skipped} skipped).")
     except Exception as e:
         conn.rollback()
         print(f"[{datetime.now()}] Error saving data to the database: {e}")
@@ -134,8 +181,12 @@ def fetch_and_save():
 def main():
     """Main execution loop polling the API every 5 minutes."""
     print(f"[{datetime.now()}] Starting parking data fetcher...")
+    ensure_schema()
     while True:
-        fetch_and_save()
+        try:
+            fetch_and_save()
+        except Exception as e:
+            print(f"[{datetime.now()}] Unexpected error in fetch cycle: {e}")
         time.sleep(300)
 
 if __name__ == "__main__":
